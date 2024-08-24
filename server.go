@@ -15,7 +15,7 @@ type AuthServer struct {
 	authorizer     Authorizer
 	authenticator  Authenticator
 	tokenGenerator TokenGenerator
-	crt, key string
+	crt, key       string
 }
 
 // NewAuthServer creates a new AuthServer
@@ -43,25 +43,51 @@ func NewAuthServer(opt *Option) (*AuthServer, error) {
 }
 
 func (srv *AuthServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// grab user's auth parameters
-	username, password, ok := r.BasicAuth()
-	if !ok {
-		http.Error(w, "unauthorized", http.StatusUnauthorized)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if err := srv.authenticator.Authenticate(username, password); err != nil {
-		http.Error(w, "unauthorized: invalid auth credentials", http.StatusUnauthorized)
-		return
+	// bypass basic auth if possible
+	username := srv.authenticator.Bypass(r)
+	if username == "" {
+		// grab user's auth parameters
+		var (
+			password string
+			ok       bool
+		)
+		switch r.Method {
+		case http.MethodGet:
+			username, password, ok = r.BasicAuth()
+			if !ok {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+		case http.MethodPost:
+			if r.PostForm.Get("grant_type") != "password" {
+				http.Error(w, "unauthorized", http.StatusUnauthorized)
+				return
+			}
+			username = r.PostForm.Get("username")
+			password = r.PostForm.Get("password")
+		default:
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		if err := srv.authenticator.Authenticate(username, password); err != nil {
+			http.Error(w, "unauthorized: invalid auth credentials", http.StatusUnauthorized)
+			return
+		}
 	}
 	req := srv.parseRequest(r)
-	actions, err := srv.authorizer.Authorize(req, username)
+	req.Username = username
+	access, err := srv.authorizer.Authorize(req)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusUnauthorized)
 		return
 	}
 	// create token for this user using the actions returned
 	// from the authorization check
-	tk, err := srv.tokenGenerator.Generate(req, actions)
+	tk, err := srv.tokenGenerator.Generate(req, access)
 	if err != nil {
 		http.Error(w, "server error", http.StatusInternalServerError)
 		return
@@ -70,25 +96,27 @@ func (srv *AuthServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (srv *AuthServer) parseRequest(r *http.Request) *AuthorizationRequest {
-	q := r.URL.Query()
-	req := &AuthorizationRequest{
-		Service: q.Get("service"),
-		Account: q.Get("account"),
+	scopes := []*ResourceActions{}
+	for _, scopeString := range r.Form["scope"] {
+		for _, s := range strings.Split(scopeString, " ") {
+			scope := &ResourceActions{}
+			parts := strings.Split(s, ":")
+			if len(parts) > 0 {
+				scope.Type = parts[0]
+			}
+			if len(parts) > 1 {
+				scope.Name = parts[1]
+			}
+			if len(parts) > 2 {
+				scope.Actions = strings.Split(parts[2], ",")
+			}
+			scopes = append(scopes, scope)
+		}
 	}
-	parts := strings.Split(r.URL.Query().Get("scope"), ":")
-	if len(parts) > 0 {
-		req.Type = parts[0]
+	return &AuthorizationRequest{
+		Service: r.Form.Get("service"),
+		Scopes:  scopes,
 	}
-	if len(parts) > 1 {
-		req.Name = parts[1]
-	}
-	if len(parts) > 2 {
-		req.Actions = strings.Split(parts[2], ",")
-	}
-	if req.Account == "" {
-		req.Account = req.Name
-	}
-	return req
 }
 
 func (srv *AuthServer) Run(addr string) error {

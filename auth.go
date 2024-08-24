@@ -5,11 +5,11 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"github.com/docker/distribution/registry/auth/token"
-	"github.com/docker/libtrust"
-	"math/rand"
+	"net/http"
 	"strings"
 	"time"
+
+	"github.com/docker/libtrust"
 )
 
 // Token rep the JWT token that'll be created when authentication/authorizations succeeds
@@ -22,6 +22,7 @@ type Token struct {
 // An implementation should return a non-nil error when authentication is not successful, otherwise
 // a nil error should be returned
 type Authenticator interface {
+	Bypass(r *http.Request) string
 	Authenticate(username, password string) error
 }
 
@@ -30,27 +31,31 @@ type Authenticator interface {
 // this function should return the list of authorized actions and a nil error. an empty list must be returned
 // if requesting user is unauthorized
 type Authorizer interface {
-	Authorize(req *AuthorizationRequest, username string) ([]string, error)
+	Authorize(req *AuthorizationRequest) ([]*ResourceActions, error)
 }
+
 // TokenGenerator: an implementation should create a valid JWT according to the spec here
 // https://github.com/docker/distribution/blob/1b9ab303a477ded9bdd3fc97e9119fa8f9e58fca/docs/spec/auth/jwt.md
 // a default implementation that follows the spec is used when it is not provided
 type TokenGenerator interface {
-	Generate(req *AuthorizationRequest, actions []string) (*Token, error)
+	Generate(req *AuthorizationRequest, access []*ResourceActions) (*Token, error)
 }
 
 // DefaultAuthenticator makes authentication successful by default
 type DefaultAuthenticator struct{}
 
-func (d *DefaultAuthenticator) Authenticate(username, password string) error {
+func (*DefaultAuthenticator) Bypass(r *http.Request) string {
+	return ""
+}
+func (*DefaultAuthenticator) Authenticate(username, password string) error {
 	return nil
 }
 
 // DefaultAuthorizer makes authorization successful by default
 type DefaultAuthorizer struct{}
 
-func (d *DefaultAuthorizer) Authorize(req *AuthorizationRequest, username string) ([]string, error) {
-	return []string{"pull", "push"}, nil
+func (*DefaultAuthorizer) Authorize(req *AuthorizationRequest) ([]*ResourceActions, error) {
+	return req.Scopes, nil
 }
 
 type tokenGenerator struct {
@@ -63,13 +68,13 @@ func newTokenGenerator(pk libtrust.PublicKey, prk libtrust.PrivateKey, opt *Toke
 	return &tokenGenerator{pubKey: pk, privateKey: prk, tokenOpt: opt}
 }
 
-func (tg *tokenGenerator) Generate(req *AuthorizationRequest, actions []string) (*Token, error) {
+func (tg *tokenGenerator) Generate(req *AuthorizationRequest, access []*ResourceActions) (*Token, error) {
 	// sign any string to get the used signing Algorithm for the private key
 	_, algo, err := tg.privateKey.Sign(strings.NewReader(signAuth), 0)
 	if err != nil {
 		return nil, err
 	}
-	header := token.Header{
+	header := Header{
 		Type:       "JWT",
 		SigningAlg: algo,
 		KeyID:      tg.pubKey.KeyID(),
@@ -79,31 +84,26 @@ func (tg *tokenGenerator) Generate(req *AuthorizationRequest, actions []string) 
 		return nil, err
 	}
 	now := time.Now().Unix()
-	claim := token.ClaimSet{
+	claim := ClaimSet{
 		Issuer:     tg.tokenOpt.Issuer,
-		Subject:    req.Account,
+		Subject:    "",
 		Audience:   req.Service,
 		Expiration: now + tg.tokenOpt.Expire,
 		NotBefore:  now - 10,
 		IssuedAt:   now,
-		JWTID:      fmt.Sprintf("%d", rand.Int63()),
-		Access:     []*token.ResourceActions{},
+		JWTID:      "",
+		Access:     access,
 	}
-	claim.Access = append(claim.Access, &token.ResourceActions{
-		Type:    req.Type,
-		Name:    req.Name,
-		Actions: actions,
-	})
 	claimJson, err := json.Marshal(claim)
 	if err != nil {
 		return nil, err
 	}
-	payload := fmt.Sprintf("%s%s%s", encodeBase64(headerJson), token.TokenSeparator, encodeBase64(claimJson))
+	payload := fmt.Sprintf("%s%s%s", encodeBase64(headerJson), tokenSeparator, encodeBase64(claimJson))
 	sig, sigAlgo, err := tg.privateKey.Sign(strings.NewReader(payload), 0)
 	if err != nil && sigAlgo != algo {
 		return nil, err
 	}
-	tk := fmt.Sprintf("%s%s%s", payload, token.TokenSeparator, encodeBase64(sig))
+	tk := fmt.Sprintf("%s%s%s", payload, tokenSeparator, encodeBase64(sig))
 	return &Token{Token: tk, AccessToken: tk}, nil
 }
 
